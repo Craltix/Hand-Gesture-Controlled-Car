@@ -7,100 +7,99 @@
 #include <RH_ASK.h>
 #include <SPI.h>   // Required by RadioHead even if unused
 
-// ── RF Receiver pin ─────────────────────────────────────────
+// ── RF Receiver pin ──────────────────────────────────────────
 #define RF_RX_PIN  12   // RF DATA → Arduino D12
-#define RF_TX_PIN  11   // Dummy TX pin (not connected to anything)
+// NOTE: We do NOT define RF_TX_PIN separately because the previous
+// code assigned it to pin 11 — the same pin used by IN4 below —
+// causing a direct conflict. The dummy TX pin is passed inline as
+// a literal to the RH_ASK constructor so it's clear it's unused.
+// Pin 7 is free and does not conflict with any other assignment.
+#define RF_TX_DUMMY  7
 
 // ── L298N motor driver pins ──────────────────────────────────
-// Left motor  → OUT1 / OUT2
-#define ENA  3    // PWM speed control — left motor (D3 is PWM on Uno)
-#define IN1  5    // Direction bit A — D5
-#define IN2  6    // Direction bit B — D6
-// Right motor → OUT3 / OUT4
-#define ENB  9    // PWM speed control — right motor (D9 is PWM on Uno)
-#define IN3  10   // Direction bit C — D10
-#define IN4  11   // Direction bit D — no PWM needed for this, D11
+// Left motor  → L298N OUT1 / OUT2
+#define ENA  3    // PWM speed — left  (D3 is hardware PWM on Uno)
+#define IN1  5    // Direction bit
+#define IN2  6    // Direction bit
+// Right motor → L298N OUT3 / OUT4
+#define ENB  9    // PWM speed — right (D9 is hardware PWM on Uno)
+#define IN3  10   // Direction bit
+// FIX: IN4 was previously pin 11, which collided with RF_TX_PIN 11.
+// Moved to D4 which is free and has no special function on the Uno.
+#define IN4  4    // Direction bit  (was 11 — CONFLICT FIXED)
 
 // ── Speed settings (0–255) ────────────────────────────────────
-#define SPEED_NORMAL   180  // Straight-line drive speed
-#define SPEED_TURN     140  // Speed of the faster side while turning
-#define SPEED_TURN_SLOW 60  // Speed of the slower side while turning
-                             // Set to 0 for a tight pivot turn
+#define SPEED_NORMAL    180  // Both motors straight ahead
+#define SPEED_TURN      160  // Faster side while turning
+#define SPEED_TURN_SLOW  50  // Slower side while turning (set to 0 for pivot)
 
 // ── Watchdog timeout ─────────────────────────────────────────
-// If no packet received within this many ms, stop motors (safety)
-#define WATCHDOG_MS  400
+#define WATCHDOG_MS  400     // Stop motors if no valid packet for 400 ms
 
-// ── Command bytes (must match transmitter) ───────────────────
+// ── Command bytes (must match transmitter exactly) ────────────
 #define CMD_FORWARD  'F'
 #define CMD_BACKWARD 'B'
 #define CMD_LEFT     'L'
 #define CMD_RIGHT    'R'
 #define CMD_STOP     'S'
 
-// ── RF driver (bps=2000, rxPin=RF_RX_PIN, txPin=RF_TX_PIN) ──
-RH_ASK rfDriver(2000, RF_RX_PIN, RF_TX_PIN, 0);
+// ── RF driver ────────────────────────────────────────────────
+// FIX 1: The original code passed 0 as a 4th (PTT) argument.
+//   RH_ASK::init() calls pinMode(_pttPin, OUTPUT) on whatever pin
+//   is passed, so passing 0 forced Arduino pin 0 (hardware Serial RX)
+//   to OUTPUT, silently breaking all Serial communication.
+// FIX 2: Three-argument constructor omits the PTT pin entirely so
+//   the library never touches pin 0 or any other unintended pin.
+RH_ASK rfDriver(2000, RF_RX_PIN, RF_TX_DUMMY);
 
-// ── State ────────────────────────────────────────────────────
+// ── State ─────────────────────────────────────────────────────
 unsigned long lastPacketTime = 0;
-char          lastCmd        = 0;
+char          lastCmd        = CMD_STOP;  // Init to STOP, not 0
 
 // =============================================================
-// Motor helpers
+// Motor helpers — all pin writes are explicit to avoid hidden state
 // =============================================================
 
 void motorsStop() {
   analogWrite(ENA, 0);
   analogWrite(ENB, 0);
-  digitalWrite(IN1, LOW);
-  digitalWrite(IN2, LOW);
-  digitalWrite(IN3, LOW);
-  digitalWrite(IN4, LOW);
+  digitalWrite(IN1, LOW); digitalWrite(IN2, LOW);
+  digitalWrite(IN3, LOW); digitalWrite(IN4, LOW);
 }
 
 void motorsForward() {
-  digitalWrite(IN1, HIGH);
-  digitalWrite(IN2, LOW);
-  digitalWrite(IN3, HIGH);
-  digitalWrite(IN4, LOW);
+  digitalWrite(IN1, HIGH); digitalWrite(IN2, LOW);
+  digitalWrite(IN3, HIGH); digitalWrite(IN4, LOW);
   analogWrite(ENA, SPEED_NORMAL);
   analogWrite(ENB, SPEED_NORMAL);
 }
 
 void motorsBackward() {
-  digitalWrite(IN1, LOW);
-  digitalWrite(IN2, HIGH);
-  digitalWrite(IN3, LOW);
-  digitalWrite(IN4, HIGH);
+  digitalWrite(IN1, LOW); digitalWrite(IN2, HIGH);
+  digitalWrite(IN3, LOW); digitalWrite(IN4, HIGH);
   analogWrite(ENA, SPEED_NORMAL);
   analogWrite(ENB, SPEED_NORMAL);
 }
 
-// Gentle arc left: right motor faster, left motor slower
+// Arc left: right motor faster, left motor slower
 void motorsLeft() {
-  digitalWrite(IN1, HIGH);
-  digitalWrite(IN2, LOW);
-  digitalWrite(IN3, HIGH);
-  digitalWrite(IN4, LOW);
-  analogWrite(ENA, SPEED_TURN_SLOW);   // left side slows down
-  analogWrite(ENB, SPEED_TURN);        // right side stays fast
+  digitalWrite(IN1, HIGH); digitalWrite(IN2, LOW);
+  digitalWrite(IN3, HIGH); digitalWrite(IN4, LOW);
+  analogWrite(ENA, SPEED_TURN_SLOW);
+  analogWrite(ENB, SPEED_TURN);
 }
 
-// Gentle arc right: left motor faster, right motor slower
+// Arc right: left motor faster, right motor slower
 void motorsRight() {
-  digitalWrite(IN1, HIGH);
-  digitalWrite(IN2, LOW);
-  digitalWrite(IN3, HIGH);
-  digitalWrite(IN4, LOW);
-  analogWrite(ENA, SPEED_TURN);        // left side stays fast
-  analogWrite(ENB, SPEED_TURN_SLOW);   // right side slows down
+  digitalWrite(IN1, HIGH); digitalWrite(IN2, LOW);
+  digitalWrite(IN3, HIGH); digitalWrite(IN4, LOW);
+  analogWrite(ENA, SPEED_TURN);
+  analogWrite(ENB, SPEED_TURN_SLOW);
 }
 
-// =============================================================
-// Execute a command character
 // =============================================================
 void executeCommand(char cmd) {
-  if (cmd == lastCmd) return;  // Already in this state
+  if (cmd == lastCmd) return;  // Already in this state — no redundant writes
   lastCmd = cmd;
 
   switch (cmd) {
@@ -122,19 +121,19 @@ void setup() {
   Serial.println("Gesture Car Receiver — Starting up...");
 
   // Motor driver pins
-  pinMode(ENA, OUTPUT);
-  pinMode(IN1, OUTPUT);
-  pinMode(IN2, OUTPUT);
-  pinMode(ENB, OUTPUT);
-  pinMode(IN3, OUTPUT);
-  pinMode(IN4, OUTPUT);
+  pinMode(ENA, OUTPUT); pinMode(IN1, OUTPUT); pinMode(IN2, OUTPUT);
+  pinMode(ENB, OUTPUT); pinMode(IN3, OUTPUT); pinMode(IN4, OUTPUT);
   motorsStop();
 
-  // RF driver
+  // FIX: Seed lastPacketTime here so the watchdog timer doesn't
+  // immediately fire on boot (previously lastPacketTime=0 and
+  // lastCmd=0≠CMD_STOP meant the watchdog printed "Signal lost"
+  // before any packet could arrive).
+  lastPacketTime = millis();
+
   if (!rfDriver.init()) {
     Serial.println("ERROR: RF driver failed to initialize!");
-    // Halt; no point continuing
-    while (true) { delay(1000); }
+    while (true) { delay(1000); }  // Halt — nothing works without RF
   }
   Serial.println("RF driver OK. Waiting for commands...");
 }
@@ -146,11 +145,11 @@ void loop() {
 
   // ── Check for incoming RF packet ─────────────────────────
   if (rfDriver.recv(buf, &buflen)) {
-    // RH_ASK appends a checksum; a valid 1-byte payload returns buflen=1
     if (buflen >= 1) {
       char cmd = (char)buf[0];
 
-      // Validate: only accept our known command characters
+      // Whitelist: only accept our five known command bytes;
+      // any other byte (noise, interference) is silently dropped.
       if (cmd == CMD_FORWARD || cmd == CMD_BACKWARD ||
           cmd == CMD_LEFT    || cmd == CMD_RIGHT    ||
           cmd == CMD_STOP) {
@@ -158,11 +157,10 @@ void loop() {
         lastPacketTime = millis();
         executeCommand(cmd);
       }
-      // Unknown byte → ignore (could be noise)
     }
   }
 
-  // ── Watchdog: stop motors if signal lost ─────────────────
+  // ── Watchdog: stop motors on signal loss ─────────────────
   if (lastCmd != CMD_STOP && millis() - lastPacketTime > WATCHDOG_MS) {
     Serial.println("Signal lost — stopping motors.");
     executeCommand(CMD_STOP);
